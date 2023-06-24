@@ -3,15 +3,22 @@ package com.artifex.mupdf.mini;
 import com.artifex.mupdf.fitz.*;
 import com.artifex.mupdf.fitz.android.*;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.FileUriExposedException;
+import android.os.ParcelFileDescriptor;
+import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
@@ -30,11 +37,14 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Stack;
-import java.io.InputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 
 public class DocumentActivity extends Activity
 {
@@ -48,10 +58,11 @@ public class DocumentActivity extends Activity
 	protected Document doc;
 
 	protected String key;
-	protected String path;
 	protected String mimetype;
+	protected SeekableInputStream stream;
 	protected byte[] buffer;
 
+	protected boolean returnToLibraryActivity;
 	protected boolean hasLoaded;
 	protected boolean isReflowable;
 	protected boolean fitPage;
@@ -88,6 +99,55 @@ public class DocumentActivity extends Activity
 	protected Stack<Integer> history;
 	protected boolean wentBack;
 
+	private String toHex(byte[] digest) {
+		StringBuilder builder = new StringBuilder(2 * digest.length);
+		for (byte b : digest)
+			builder.append(String.format("%02x", b));
+		return builder.toString();
+	}
+
+	private void openInput(Uri uri, long size, String mimetype) throws IOException {
+		ContentResolver cr = getContentResolver();
+
+		Log.i(APP, "Opening document " + uri);
+
+		InputStream is = cr.openInputStream(uri);
+		byte[] buf = null;
+		int used = -1;
+		try {
+			final int limit = 8 * 1024 * 1024;
+			if (size < 0) { // size is unknown
+				buf = new byte[limit];
+				used = is.read(buf);
+				boolean atEOF = is.read() == -1;
+				if (used < 0 || (used == limit && !atEOF)) // no or partial data
+					buf = null;
+			} else if (size <= limit) { // size is known and below limit
+				buf = new byte[(int) size];
+				used = is.read(buf);
+				if (used < 0 || used < size) // no or partial data
+					buf = null;
+			}
+			if (buf != null && buf.length != used) {
+				byte[] newbuf = new byte[used];
+				System.arraycopy(buf, 0, newbuf, 0, used);
+				buf = newbuf;
+			}
+		} catch (OutOfMemoryError e) {
+			buf = null;
+		} finally {
+			is.close();
+		}
+
+		if (buf != null) {
+			Log.i(APP, "  Opening document from memory buffer of size " + buf.length);
+			buffer = buf;
+		} else {
+			Log.i(APP, "  Opening document from stream");
+			stream = new ContentInputStream(cr, uri, size);
+		}
+	}
+
 	public void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 		requestWindowFeature(Window.FEATURE_NO_TITLE);
@@ -106,25 +166,67 @@ public class DocumentActivity extends Activity
 
 		Uri uri = getIntent().getData();
 		mimetype = getIntent().getType();
+
+		if (uri == null) {
+			Toast.makeText(this, "No document uri to open", Toast.LENGTH_SHORT).show();
+			return;
+		}
+
+		returnToLibraryActivity = getIntent().getIntExtra(getComponentName().getPackageName() + ".ReturnToLibraryActivity", 0) != 0;
+
 		key = uri.toString();
-		if (uri.getScheme().equals("file")) {
-			title = uri.getLastPathSegment();
-			path = uri.getPath();
-		} else {
-			title = uri.toString();
-			try {
-				InputStream stm = getContentResolver().openInputStream(uri);
-				ByteArrayOutputStream out = new ByteArrayOutputStream();
-				byte[] buf = new byte[16384];
-				int n;
-				while ((n = stm.read(buf)) != -1)
-					out.write(buf, 0, n);
-				out.flush();
-				buffer = out.toByteArray();
-			} catch (IOException x) {
-				Log.e(APP, x.toString());
-				Toast.makeText(this, x.getMessage(), Toast.LENGTH_SHORT).show();
+
+		Log.i(APP, "OPEN URI " + uri.toString());
+		Log.i(APP, "  MAGIC (Intent) " + mimetype);
+
+		title = "";
+		long size = -1;
+		Cursor cursor = null;
+
+		try {
+			cursor = getContentResolver().query(uri, null, null, null, null, null);
+			if (cursor != null && cursor.moveToFirst()){
+				int idx;
+
+				idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+				if (idx >= 0 && cursor.getType(idx) == Cursor.FIELD_TYPE_STRING)
+					title = cursor.getString(idx);
+
+				idx = cursor.getColumnIndex(OpenableColumns.SIZE);
+				if (idx >= 0 && cursor.getType(idx) == Cursor.FIELD_TYPE_INTEGER)
+					size = cursor.getLong(idx);
+
+				if (size == 0)
+					size = -1;
 			}
+		} catch (Exception x) {
+			// Ignore any exception and depend on default values for title
+			// and size (unless one was decoded
+		} finally {
+			if (cursor != null)
+				cursor.close();
+		}
+
+		Log.i(APP, "  NAME " + title);
+		Log.i(APP, "  SIZE " + size);
+
+		if (mimetype == null || mimetype.equals("application/octet-stream")) {
+			mimetype = getContentResolver().getType(uri);
+			Log.i(APP, "  MAGIC (Resolver) " + mimetype);
+		}
+		if (mimetype == null || mimetype.equals("application/octet-stream")) {
+			mimetype = title;
+			Log.i(APP, "  MAGIC (Filename) " + mimetype);
+		}
+
+		try {
+			openInput(uri, size, mimetype);
+		} catch (Exception x) {
+			Log.e(APP, x.toString());
+			String text = x.getMessage();
+			if (text == null)
+				text = x.getClass().getName();
+			Toast.makeText(this, text, Toast.LENGTH_SHORT).show();
 		}
 
 		titleLabel = (TextView)findViewById(R.id.title_label);
@@ -257,6 +359,31 @@ public class DocumentActivity extends Activity
 		});
 	}
 
+	public boolean onKeyUp(int keyCode, KeyEvent event) {
+		switch (keyCode) {
+		case KeyEvent.KEYCODE_PAGE_UP:
+		case KeyEvent.KEYCODE_COMMA:
+		case KeyEvent.KEYCODE_B:
+			goBackward();
+			return true;
+		case KeyEvent.KEYCODE_PAGE_DOWN:
+		case KeyEvent.KEYCODE_PERIOD:
+		case KeyEvent.KEYCODE_SPACE:
+			goForward();
+			return true;
+		case KeyEvent.KEYCODE_M:
+			history.push(currentPage);
+			return true;
+		case KeyEvent.KEYCODE_T:
+			if (!history.empty()) {
+				currentPage = history.pop();
+				loadPage();
+			}
+			return true;
+		}
+		return super.onKeyUp(keyCode, event);
+	}
+
 	public void onPageViewSizeChanged(int w, int h) {
 		pageZoom = 1;
 		canvasW = w;
@@ -285,10 +412,10 @@ public class DocumentActivity extends Activity
 			boolean needsPassword;
 			public void work() {
 				Log.i(APP, "open document");
-				if (path != null)
-					doc = Document.openDocument(path);
-				else
+				if (buffer != null)
 					doc = Document.openDocument(buffer, mimetype);
+				else
+					doc = Document.openDocument(stream, mimetype);
 				needsPassword = doc.needsPassword();
 			}
 			public void run() {
@@ -345,16 +472,22 @@ public class DocumentActivity extends Activity
 
 	public void onPause() {
 		super.onPause();
-		SharedPreferences.Editor editor = prefs.edit();
-		editor.putFloat("layoutEm", layoutEm);
-		editor.putBoolean("fitPage", fitPage);
-		editor.putInt(key, currentPage);
-		editor.apply();
+		if (prefs != null) {
+			SharedPreferences.Editor editor = prefs.edit();
+			editor.putFloat("layoutEm", layoutEm);
+			editor.putBoolean("fitPage", fitPage);
+			editor.putInt(key, currentPage);
+			editor.apply();
+		}
 	}
 
 	public void onBackPressed() {
 		if (history.empty()) {
 			super.onBackPressed();
+			if (returnToLibraryActivity) {
+				Intent intent = getPackageManager().getLaunchIntentForPackage(getComponentName().getPackageName());
+				startActivity(intent);
+			}
 		} else {
 			currentPage = history.pop();
 			loadPage();
@@ -395,7 +528,7 @@ public class DocumentActivity extends Activity
 				for (int i = 0; i < 9; ++i) {
 					Log.i(APP, "search page " + searchPage);
 					Page page = doc.loadPage(searchPage);
-					Quad[] hits = page.search(searchNeedle);
+					Quad[][] hits = page.search(searchNeedle);
 					page.destroy();
 					if (hits != null && hits.length > 0) {
 						searchHitPage = searchPage;
@@ -451,7 +584,7 @@ public class DocumentActivity extends Activity
 				try {
 					Log.i(APP, "load document");
 					String metaTitle = doc.getMetaData(Document.META_INFO_TITLE);
-					if (metaTitle != null)
+					if (metaTitle != null && !metaTitle.equals(""))
 						title = metaTitle;
 					isReflowable = doc.isReflowable();
 					if (isReflowable) {
@@ -484,11 +617,11 @@ public class DocumentActivity extends Activity
 		worker.add(new Worker.Task() {
 			public void work() {
 				try {
-					long mark = doc.makeBookmark(currentPage);
+					long mark = doc.makeBookmark(doc.locationFromPageNumber(currentPage));
 					Log.i(APP, "relayout document");
 					doc.layout(layoutW, layoutH, layoutEm);
 					pageCount = doc.countPages();
-					currentPage = doc.findBookmark(mark);
+					currentPage = doc.pageNumberFromLocation(doc.findBookmark(mark));
 				} catch (Throwable x) {
 					pageCount = 1;
 					currentPage = 0;
@@ -507,7 +640,10 @@ public class DocumentActivity extends Activity
 			private void flattenOutline(Outline[] outline, String indent) {
 				for (Outline node : outline) {
 					if (node.title != null)
-						flatOutline.add(new OutlineActivity.Item(indent + node.title, node.page));
+					{
+						int outlinePage = doc.pageNumberFromLocation(doc.resolveLink(node));
+						flatOutline.add(new OutlineActivity.Item(indent + node.title, node.uri, outlinePage));
+					}
 					if (node.down != null)
 						flattenOutline(node.down, indent + "    ");
 				}
@@ -536,7 +672,7 @@ public class DocumentActivity extends Activity
 		worker.add(new Worker.Task() {
 			public Bitmap bitmap;
 			public Link[] links;
-			public Quad[] hits;
+			public Quad[][] hits;
 			public void work() {
 				try {
 					Log.i(APP, "load page " + pageNumber);
@@ -550,12 +686,13 @@ public class DocumentActivity extends Activity
 					links = page.getLinks();
 					if (links != null)
 						for (Link link : links)
-							link.bounds.transform(ctm);
+							link.getBounds().transform(ctm);
 					if (searchNeedle != null) {
 						hits = page.search(searchNeedle);
 						if (hits != null)
-							for (Quad hit : hits)
-								hit.transform(ctm);
+							for (Quad[] hit : hits)
+								for (Quad chr : hit)
+									chr.transform(ctm);
 					}
 					if (zoom != 1)
 						ctm.scale(zoom);
@@ -632,11 +769,18 @@ public class DocumentActivity extends Activity
 		}
 	}
 
+	public void gotoPage(String uri) {
+		gotoPage(doc.pageNumberFromLocation(doc.resolveLink(uri)));
+	}
+
 	public void gotoURI(String uri) {
 		Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
 		intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_WHEN_TASK_RESET); // FLAG_ACTIVITY_NEW_DOCUMENT in API>=21
 		try {
 			startActivity(intent);
+		} catch (FileUriExposedException x) {
+			Log.e(APP, x.toString());
+			Toast.makeText(DocumentActivity.this, "Android does not allow following file:// link: " + uri, Toast.LENGTH_LONG).show();
 		} catch (Throwable x) {
 			Log.e(APP, x.getMessage());
 			Toast.makeText(DocumentActivity.this, x.getMessage(), Toast.LENGTH_SHORT).show();
